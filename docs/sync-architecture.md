@@ -72,6 +72,7 @@ These settings belong to the user's machines, git, and security policy. `sync-vm
 | VM OS and architecture | Auto-detected over SSH |
 | Agent distribution | Every agent build is embedded in `sync-vm` (estimated ~30 MB total) |
 | Transport | One SSH connection per VM. The agent's stdin and stdout carry the protocol. The TCP tunnel mode is removed. |
+| Dependencies | Company policy. Only the Go standard library, `golang.org/x/...` modules, and `github.com/fsnotify/fsnotify`. `~/.ssh/config` parsing, the `known_hosts` algorithm lookup, and the SFTP client are written in this repo. A test fails the build if `go.mod` requires any other module. |
 
 ## Commands
 
@@ -240,7 +241,7 @@ The host always sends the data frames for a `Put`, even when the agent ends up n
 
 ## Modules
 
-Two binaries, six internal packages.
+Two binaries, eight internal packages.
 
 ```
 cmd/sync-vm/          host CLI: parse the command, then run init, a vm or allowlist subcommand, or sync
@@ -248,6 +249,8 @@ cmd/sync-vm-agent/    VM agent: agent.Serve over stdin and stdout
 internal/protocol/    framing, message types, RelPath parsing
 internal/repo/        find the repo and git folder, parse targets, load and save sync-vm.json
 internal/bootstrap/   SSH connections and login, detect the VM platform, install and start the agent
+internal/sshconfig/   parse ~/.ssh/config for the settings bootstrap supports
+internal/sftp/        the SFTP v3 client subset bootstrap uses to install the agent
 internal/files/       list, stat, and watch host files
 internal/engine/      the host sync loop per VM, and the pure Diff function
 internal/agent/       apply changes inside the VM root
@@ -274,11 +277,11 @@ Libraries:
 
 | Library | Use |
 |---|---|
-| `golang.org/x/crypto/ssh` | SSH client, key parsing, sessions |
-| `github.com/skeema/knownhosts` | Reading and writing `known_hosts`. It wraps `golang.org/x/crypto/ssh/knownhosts` and adds `HostKeyAlgorithms`, described below. |
-| `github.com/kevinburke/ssh_config` | Reading `~/.ssh/config`, including `Include` |
-| `github.com/pkg/sftp` | Uploading the agent over the same connection |
+| `golang.org/x/crypto/ssh` | SSH client, key parsing, sessions, and the `sftp` subsystem channel |
+| `golang.org/x/crypto/ssh/knownhosts` | Checking host keys and writing new `known_hosts` lines. The algorithm lookup is built on it, as described in "Check the host key". |
 | `golang.org/x/term` | Reading a passphrase or password without echo |
+| `internal/sshconfig` | Reading `~/.ssh/config`, including `Include`. See "Parse the SSH config". |
+| `internal/sftp` | Uploading the agent over the same connection. See "The SFTP client". |
 
 `NewAuth() *Auth` creates the store of unlocked keys and passwords. One `Auth` serves the whole process and every VM in it. It holds:
 
@@ -304,6 +307,19 @@ Split `target` into an optional user and a host at the last `@`. Look the host u
 
 Ignore every other setting. With `-v`, log the name of each ignored setting that applies to the host, so a user can see why a setting has no effect. `Match` blocks aren't supported and are ignored.
 
+#### Parse the SSH config
+
+`internal/sshconfig` reads the file the way OpenSSH does, for the settings above only. `Lookup(host) (Settings, []string ignored, error)` returns the five settings for one host, and the names of the other settings that applied to it, for the `-v` log.
+
+- **Lines.** Trim whitespace. Skip empty lines and lines starting with `#`. A line is a keyword and its arguments, separated by whitespace or by one `=` with optional whitespace around it, so `Port 22` and `Port=22` are the same. Keywords ignore letter case. An argument may be wrapped in double quotes, which allows spaces inside it.
+- **Blocks.** Lines before the first `Host` or `Match` apply to every host. `Host <pattern>...` starts a block that applies when the host matches at least one pattern and no pattern starting with `!`. In a pattern, `*` matches any run of characters and `?` matches one, ignoring letter case. The host matched is the one written in the target, not its `HostName`. `Match` starts a block that never applies, up to the next `Host` or `Match`.
+- **First value wins.** For each keyword, the first value from an applying line is the one used, and later lines for that keyword are skipped. Put specific `Host` blocks before `Host *`, as with `ssh`. The exception is `IdentityFile`, which collects every value from every applying line, in order.
+- **`Include`.** Each argument is a path or a glob. A relative path is relative to `~/.ssh`. Expand a leading `~`. Expand globs with `filepath.Glob`, which returns sorted names. Parse each file in place, as if its lines appeared at the `Include`, under the condition of the block the `Include` sits in. A missing file is skipped, as `ssh` does. Stop with an error after 16 nested levels, so a file that includes itself can't loop.
+- **Tokens.** In `HostName` and `IdentityFile`, replace `%h` with the host, `%d` with the local home folder, `%u` with the local user name, `%r` with the remote user, and `%%` with `%`. Any other `%` token makes that value invalid. Skip it with a warning naming the token.
+- **Errors.** A missing `~/.ssh/config` is an empty config. A `Port` that isn't a number from 1 to 65535 is an error that names the file and line.
+
+A setting from an `Include`d file is no different from one in the main file. No other part of `sync-vm` reads `~/.ssh/config`.
+
 #### Log in
 
 Set `ssh.ClientConfig.Auth` to these methods, in this order:
@@ -322,7 +338,16 @@ In normal use, prompts appear only at startup: once per key, once per password-o
 
 #### Check the host key
 
-Load `~/.ssh/known_hosts` with `knownhosts.New`. A missing file counts as empty. Look the VM up by `HostName` and `Port`. Set `ssh.ClientConfig.HostKeyAlgorithms` to the result of `HostKeyAlgorithms` for that address. Without that, a server can offer an RSA key while `known_hosts` holds its Ed25519 key, and the check fails even though the VM is genuine.
+Load `~/.ssh/known_hosts` with `knownhosts.New` from `golang.org/x/crypto/ssh/knownhosts`. A missing file counts as empty. Look the VM up by `HostName` and `Port`, joined with `net.JoinHostPort`. With `ProxyJump`, look up the VM's own address, not the jump host's. Set `ssh.ClientConfig.HostKeyAlgorithms` to the algorithms of the keys already known for that address. Without that, a server can offer an RSA key while `known_hosts` holds its Ed25519 key, and the check fails even though the VM is genuine.
+
+Find the known keys through the callback itself, not by parsing `known_hosts` again. The callback already handles hashed host names (`|1|...`), `[host]:port` entries, wildcard patterns, and `@revoked` lines, and a second parser would disagree with it on some of them.
+
+1. Generate one Ed25519 public key with `crypto/ed25519` when the process starts. It is random, so it never appears in `known_hosts`.
+2. Call the callback with the address and that key. It returns a `*knownhosts.KeyError`. Its `Want` list holds every key known for the address. An empty `Want` means the host is unknown.
+3. Take each key's `Type()`, in order, without repeats. Replace `ssh-rsa` with `rsa-sha2-512`, `rsa-sha2-256`, and `ssh-rsa`, in that order, because a server signs with an RSA key under those three algorithm names.
+4. If the host is unknown, leave `HostKeyAlgorithms` unset, so the server's preferred key is offered and shown in the trust prompt.
+
+The `HostKeyCallback` passed to `ssh.ClientConfig` wraps the same callback and turns its result into the rows below. A `*knownhosts.KeyError` with an empty `Want` is "not known". One with a non-empty `Want` is "known, but with a different key". A `*knownhosts.RevokedError` fails that VM without retrying, and names the revoked key.
 
 | Lookup result | Action |
 |---|---|
@@ -340,7 +365,7 @@ Start a keepalive goroutine. Every 15 seconds, send the global request `keepaliv
 
 1. **Detect the platform.** Run `uname -sm` in a session. If it fails, run `cmd /c echo %PROCESSOR_ARCHITECTURE%` in a new session. The login shell is unknown (sh, cmd, or PowerShell), and each probe works in every shell of its OS family. Map `x86_64`/`AMD64` to amd64 and `aarch64`/`arm64`/`ARM64` to arm64.
 2. **Pick the embedded build** `agents/<os>-<arch>/sync-vm-agent[.exe]`.
-3. **Install if missing.** Open an SFTP client on the connection with `sftp.NewClient`. The install path is `.sync-vm/agent/<first 16 hex chars of the binary's SHA-256>/sync-vm-agent[.exe]`, relative to the SFTP start folder, which is the login user's home folder. If `Stat` finds it, skip to step 4. Otherwise:
+3. **Install if missing.** Open an SFTP client on the connection with `internal/sftp` (see "The SFTP client"). The install path is `.sync-vm/agent/<first 16 hex chars of the binary's SHA-256>/sync-vm-agent[.exe]`, relative to the SFTP start folder, which is the login user's home folder. If `Stat` finds it, skip to step 4. Otherwise:
 	1. `MkdirAll` the folder.
 	2. Write the binary to the same name plus `.tmp`.
 	3. On Linux and macOS, `Chmod` it to `0755`.
@@ -359,6 +384,26 @@ Remote commands per OS. Each session runs its command through the VM's login she
 Avoid parentheses in Windows commands. PowerShell evaluates `(exit 0)` itself before `cmd` sees it.
 
 Old agent builds pile up in `.sync-vm/agent/` as `sync-vm` is upgraded. The agent removes them itself. See agent step 0.
+
+#### The SFTP client
+
+`internal/sftp` implements only what the install step needs, from SFTP version 3 (`draft-ietf-secsh-filexfer-02`), the version OpenSSH's `sftp-server` speaks on Linux, macOS, and Windows. It uses SFTP and not shell commands, because the login shell is unknown. Sending a binary through PowerShell's input, or through `certutil` with cmd's 8,191-character command limit, is not reliable. SFTP never involves the shell.
+
+`NewClient(*ssh.Client)` opens a session, calls `RequestSubsystem("sftp")`, and sends `SSH_FXP_INIT` with version 3. A refused subsystem returns the "doesn't offer SFTP" error from step 3. The `SSH_FXP_VERSION` reply lists the server's extensions. Remember whether it includes `posix-rename@openssh.com`.
+
+Each packet is a 4-byte big-endian length, a 1-byte type, then the fields, with strings as a 4-byte length and the bytes. Every request carries a request ID. Send one request at a time and wait for its reply. The install runs once per `sync-vm` version per VM, so pipelining isn't worth the code.
+
+| Method | Request | Success reply |
+|---|---|---|
+| `Stat(path)` | `SSH_FXP_STAT` | `SSH_FXP_ATTRS`. `SSH_FX_NO_SUCH_FILE` returns an error that `errors.Is(err, fs.ErrNotExist)` matches. |
+| `MkdirAll(path)` | `SSH_FXP_STAT`, then `SSH_FXP_MKDIR` for each missing segment from the top | `SSH_FX_OK` |
+| `WriteFile(path, r)` | `SSH_FXP_OPEN` with `WRITE`, `CREAT`, and `TRUNC`, then `SSH_FXP_WRITE` in 32 KB chunks with increasing offsets, then `SSH_FXP_CLOSE` | `SSH_FXP_HANDLE`, then `SSH_FX_OK` for each write and the close |
+| `Chmod(path, mode)` | `SSH_FXP_SETSTAT` with only the permissions flag | `SSH_FX_OK` |
+| `Remove(path)` | `SSH_FXP_REMOVE` | `SSH_FX_OK` |
+| `Rename(from, to)` | `SSH_FXP_RENAME` | `SSH_FX_OK` |
+| `PosixRename(from, to)` | `SSH_FXP_EXTENDED` named `posix-rename@openssh.com` | `SSH_FX_OK` |
+
+Any other status becomes an error carrying the status code and the server's message. A reply with an unexpected request ID or type is a protocol error that closes the client. Paths use `/` on every OS. A relative path is relative to the login user's home folder, on Windows OpenSSH too. 32 KB writes stay well under every server's packet limit.
 
 ### files
 
@@ -681,6 +726,8 @@ A missing or damaged state record never keeps a VM edit. With no record, the pat
 - **Running `ssh.exe` and letting it prompt.** Each `ssh` process asks for the passphrase again. That means several prompts per connection, and one more set on every reconnect, often while the user is away. Windows OpenSSH has no `ControlMaster` to share one connection.
 - **Feeding the passphrase to `ssh.exe` through `SSH_ASKPASS`.** It needs OpenSSH 8.4 or newer for `SSH_ASKPASS_REQUIRE`, and many Windows 10 machines ship 8.1. Passing the secret safely to each child process is also fiddly.
 - **A private ssh-agent that only `sync-vm`'s `ssh` processes use.** It works, but it is an ssh-agent under another name. Where ssh-agent is blocked by policy, it likely breaks the same rule.
+- **`github.com/skeema/knownhosts`, `github.com/kevinburke/ssh_config`, and `github.com/pkg/sftp`.** They do what the in-house code does, but company policy allows only the standard library, `golang.org/x/...`, and `fsnotify`. Vendoring them with `go mod vendor` doesn't help, because vendored code is still third-party code.
+- **Installing the agent with shell commands instead of SFTP**, such as `cat > file` on Linux, or base64 through `certutil` or PowerShell on Windows. Each shell needs its own command, PowerShell's input isn't safe for binary data, and cmd's command length limit makes a base64 upload take over a thousand round trips. Running `scp -t` on the VM needs `scp` there and a rename command per shell. SFTP avoids the shell entirely.
 - **Requiring a key without a passphrase.** That is the user's choice to make, not `sync-vm`'s. It still works: such a key never prompts.
 
 Mutagen installs its agent over SSH in a similar, versioned way. It's worth reading as prior art, though the requirements rule out using it.
@@ -689,11 +736,11 @@ Mutagen installs its agent over SSH in a similar, versioned way. It's worth read
 
 Each step ends in a check before the next starts.
 
-1. Write `protocol` and `Diff`. Unit tests with plain data, including a round trip of every message, a put larger than one data frame, a traversal path rejected on decode, a `.sync-vm/...` path rejected on decode, and one case per `Diff` row, with and without `reset`. Add cases where only `Exec` differs, for rows 4 and 7. Round-trip a `Copy`, and a manifest of 25,000 files, which must arrive as three messages. Test `PlanCopies` with plain data: a folder rename becomes copies then deletes, a duplicate file becomes a copy, a VM-edited source is not used, a path in `noCopy` stays a put, a case-only rename stays a put, a file that turns into a folder stays a put, and with several sources the lowest path is chosen.
+1. Write `protocol` and `Diff`, and the dependency test: it reads `go.mod` and fails if any `require` line names a module other than `golang.org/x/...` or `github.com/fsnotify/fsnotify`. Unit tests with plain data, including a round trip of every message, a put larger than one data frame, a traversal path rejected on decode, a `.sync-vm/...` path rejected on decode, and one case per `Diff` row, with and without `reset`. Add cases where only `Exec` differs, for rows 4 and 7. Round-trip a `Copy`, and a manifest of 25,000 files, which must arrive as three messages. Test `PlanCopies` with plain data: a folder rename becomes copies then deletes, a duplicate file becomes a copy, a VM-edited source is not used, a path in `noCopy` stays a put, a case-only rename stays a put, a file that turns into a folder stays a put, and with several sources the lowest path is chosen.
 2. Write `agent`. Test in-process against temp folders over an in-memory pipe. Cover each branch of step 4: a new file, matching content, an unedited file, an edited file (check `overwrote` and the saved copy), and a file with no state record. Cover a delete of an edited file, and a crash simulated by writing a file without saving state. Cover each destination check: `~` expansion, a relative path, a path in the system-folder list, and a link that points into one, each with every command. Then a file instead of a folder. Then every cell of the check 5 table. Check that a normal run never creates a folder or changes an owner, and that a takeover keeps every record. Build the system-folder list from injected environment values, so the Windows rows run in tests on any OS. On Linux and macOS, check that a put with `exec` true creates mode `0755`, and that a put with only the flag changed calls `os.Chmod` without writing content. Check that step 0 removes sibling folders under `.sync-vm/agent/` older than 7 days, and keeps newer ones and its own. Check that temporary files are created under `.sync-vm/tmp/` and never beside the target, and that a leftover file there is deleted at the next session start. Check a copy with a matching source, a missing source, and a source edited on the VM. Check a delete whose parent folder can't be removed: the delete still succeeds. Check the `Ack` schedule with a fake clock: after 32 operations, after 50 ms, and when the queue empties. Check that 10,000 puts in a row save `state.json` at most once per simulated second. Check the save order with a fake filesystem that records calls: flush, write `state.json.tmp`, sync it, rename, sync the folder. Simulate a power loss by keeping `state.json` but truncating a file written after the last flush, and check that the host sends it again instead of keeping it. Check that a damaged `state.json` gives rejection D, and that `init -force` replaces it.
 3. Write `repo` and `files`. Test against temp git repos. For `repo`, cover `ParseTarget` with a Linux path, a Windows path, and no path. Cover a `Load` and `Save` round trip, and `Find` in a worktree, which must return the worktree's own git folder. For `files`, check that `List` doesn't open a file whose size and modified time match a cache record, using a counting file opener. Check the same for a record added by `Seed`. Check the 2-second rule with an injected clock and file times: a time with a zero sub-second part, less than 2 seconds old, gets `ModTime` zero and is hashed again on the next `List`. A time with a nonzero sub-second part keeps its value. Check that two `List` calls at once run git and hash each file only once. Check that `Stat` on a known path runs no git command, by counting git calls. Check that each name on the editor temporary-file list is skipped when untracked and kept when tracked. Check that `Watch` sends a batch within 1 second while a file changes every 100 ms, and sends one `nil` after several index changes within 2 seconds. Run `List` from several goroutines with the race detector on. Check that `List` sets `Exec` from mode `100755`, skips a submodule and a symlink with a warning, and includes an ignored `.env` only when an allowlist pattern matches it. Check that `List` returns an error, not an empty map, while `.git/index.lock` exists and git refuses to run. Check that `Stat` drops a new file under an ignored folder, keeps a new untracked file that isn't ignored, and falls back to `List` above 500 paths. Check that `Watch` drops events under `.git/` and sends `nil` for a `.gitignore` change. Check `CRLFScripts` against a repo with `core.autocrlf=true`, containing a `.sh` file, an executable file, and a plain text file.
 4. Write `engine` and `cmd/sync-vm`. Test end to end in one process, with no SSH: create, edit, delete, rename, and kill the connection mid-sync, and check that the folders converge. Then edit a file on the VM side, reconnect, and check that the edit is kept. Change that file on the host and check that it is replaced and reported. Run once with `reset` and check that every VM edit is replaced. Restart the host with a new `Tree`, change one host file, and check that the host opens only that file. Sync to two in-process agents at once, kill one connection, and check that the other keeps converging. Check that each changed host file is opened once, not once per VM. Rename a folder of 1,000 files on the host, and check that no host file is opened and that every operation sent is a copy or a delete. Edit the source of a planned copy on the VM side first, and check that the failed copy is retried as a put. Run `init` twice for one target with different paths and check the second is refused. Check that `init` refuses the target names `init`, `vm`, and `allowlist`. Check `vm remove`, and check `vm list` output with no VMs, one VM, and two VMs. Check `allowlist add` with a new pattern, a duplicate, and a pattern git rejects. Check `allowlist remove` with a saved pattern and an unsaved one, and check `allowlist list`. Make the host listing fail and check that nothing is sent and the next pass retries. Make the host listing empty while the VM has files, and check that nothing is deleted. Check the output lines: `up to date (<n> files)` once after the initial sync, `synced: ...` only after batches that changed something, and nothing for a batch with no changes. Test argument parsing as a table: flags before, after, and between words; `--` before a word that starts with `-`; `--force` and `-force` alike; `-reset` with `init` rejected with status 2; the wrong number of words for each command; `vm` and `allowlist` with a missing or unknown subcommand; `-h` and `-version` exiting 0 outside a git repo; and `-h` winning over every other argument.
-5. Write `bootstrap` and `scripts/build-dist.sh`, which builds every agent into `internal/bootstrap/agents/` before building `sync-vm`. First test `bootstrap` in-process against an SSH server built with `golang.org/x/crypto/ssh` and `pkg/sftp`'s server, with prompts answered by a fake prompter that counts calls:
+5. Write `bootstrap` and `scripts/build-dist.sh`, which builds every agent into `internal/bootstrap/agents/` before building `sync-vm`. Test `internal/sshconfig` with table tests: `Key value` and `Key=value`, quoted values, first value wins across blocks, `IdentityFile` collecting from several blocks, `*`, `?`, and `!` patterns, a `Match` block skipped, `Include` with a relative path, a glob, and inside a `Host` block, a missing included file skipped, a self-include stopped at 16 levels, each `%` token, an unknown token skipped, and a bad `Port`. Test the known-hosts algorithm lookup against `known_hosts` files with a plain entry, a hashed entry, a `[host]:2222` entry, a wildcard entry, and an RSA entry, which must give the three RSA names in order. Test `internal/sftp` against OpenSSH's real `sftp-server` binary, run as the `sftp` subsystem of an in-process SSH server built with `golang.org/x/crypto/ssh`. Look for it at `/usr/lib/openssh/sftp-server`, `/usr/libexec/sftp-server`, `/usr/libexec/openssh/sftp-server`, `C:\Windows\System32\OpenSSH\sftp-server.exe` (installed with the Windows OpenSSH server feature, not the client), and `C:\Program Files\Git\usr\lib\ssh\sftp-server.exe` (shipped with Git for Windows), and skip the test with a message when none exists. Cover `Stat` of a missing path, `MkdirAll` of a nested path, a `WriteFile` of 1 MB that reads back identical, `Chmod`, and both renames. Then test `bootstrap` in-process against an in-process SSH server with that `sftp` subsystem, with prompts answered by a fake prompter that counts calls:
 	- Two dials with the same passphrase-protected key, then a reconnect, prompt exactly once.
 	- A wrong passphrase is asked again, up to 3 tries.
 	- A password-only server and a keyboard-interactive server each prompt once per run. A rejected stored password is forgotten and asked again.

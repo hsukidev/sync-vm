@@ -4,7 +4,9 @@ Tickets for implementing `docs/sync-architecture.md`. Each ticket is a vertical 
 
 Until ticket 13, the host engine talks to the agent in-process over an in-memory pipe, behind a dialer interface that ticket 01 introduces. Ticket 13 puts the real SSH dialer behind the same interface.
 
-Frontier at the start: 01. After 01: 02, 05, 07, 08, 09, 11 can run in parallel.
+Frontier at the start: 01, 16, 17. After 01: 02, 05, 07, 08, 09, 11 can run in parallel.
+
+Dependency policy (company rule): only the Go standard library, `golang.org/x/...`, and `github.com/fsnotify/fsnotify`. Ticket 01 adds a test that enforces it. Tickets 16 and 17 replace `kevinburke/ssh_config` and `pkg/sftp` with code in this repo, and ticket 13 replaces `skeema/knownhosts`.
 
 | # | Title | Blocked by |
 |---|---|---|
@@ -20,9 +22,11 @@ Frontier at the start: 01. After 01: 02, 05, 07, 08, 09, 11 can run in parallel.
 | 10 | Allowlist and listing filters | 02 |
 | 11 | Executable bit and CRLF warning | 01 |
 | 12 | Several VMs in one process | 05, 06 |
-| 13 | SSH bootstrap to a real VM | 03 |
+| 13 | SSH bootstrap to a real VM | 03, 16, 17 |
 | 14 | SSH login prompts | 13 |
 | 15 | SSH connection robustness | 13 |
+| 16 | In-house SSH config parser | None |
+| 17 | In-house SFTP client | None |
 
 ---
 
@@ -34,7 +38,8 @@ Frontier at the start: 01. After 01: 02, 05, 07, 08, 09, 11 can run in parallel.
 
 **Status:** ready-for-agent
 
-- [ ] Go module with `cmd/sync-vm`, `cmd/sync-vm-agent`, and the six internal packages from "Modules" (empty where not yet needed).
+- [ ] Go module with `cmd/sync-vm`, `cmd/sync-vm-agent`, and the internal packages from "Modules" (empty where not yet needed).
+- [ ] Dependency test: reads `go.mod` and fails if any `require` names a module other than `golang.org/x/...` or `github.com/fsnotify/fsnotify`. Verified by adding a disallowed module and seeing the test fail.
 - [ ] `protocol`: frame format (4-byte length, `M`/`D` tag, 64 MB cap), JSON messages `Hello`, `Manifest`, `Put` + 1 MB data frames, `Delete`, `Ack`, `Fatal`; `Conn` with concurrent `Send`/`Recv`; a received `Put` exposes content as an `io.Reader`.
 - [ ] `RelPath` parser rejecting every case listed under Data, including `.sync-vm` as a first segment in any case; paths parsed on decode on both sides.
 - [ ] `Manifest` split into messages of at most 10,000 files with `more`; a 25,000-file manifest round-trips as three messages.
@@ -241,22 +246,23 @@ Frontier at the start: 01. After 01: 02, 05, 07, 08, 09, 11 can run in parallel.
 
 **What to build:** `sync-vm init linux` and `sync-vm` work against a real VM over a built-in SSH client: no `ssh.exe`, no manual agent install. The right agent build is detected, uploaded once per version, and started over the SSH session's stdin/stdout.
 
-**Blocked by:** 03
+**Blocked by:** 03, 16, 17
 
 **Status:** ready-for-agent
 
 - [ ] `scripts/build-dist.sh` builds agents for linux/darwin/windows × amd64/arm64 into the embedded agents folder, then builds `sync-vm` with the version `-ldflags`.
-- [ ] Target resolution from `~/.ssh/config` via `kevinburke/ssh_config`: `HostName`, `User` (target's `user@` wins), `Port`, repeated `IdentityFile` with `~` expansion and documented defaults.
+- [ ] Target resolution through `internal/sshconfig` (ticket 16): `HostName`, `User` (target's `user@` wins), `Port`, repeated `IdentityFile`, and the documented defaults.
 - [ ] Key login with unencrypted keys via `golang.org/x/crypto/ssh`; unreadable/unsupported keys (`.ppk`, `sk-`) skipped with a warning.
-- [ ] Host key check with `skeema/knownhosts`: `HostKeyAlgorithms` set from known entries; known-match continues; changed key fails without retry and prints the documented warning; unknown key prompts with fingerprint and appends on `y`/`yes` (creating `~/.ssh` and the file, `0600` on Linux/macOS).
+- [ ] Host key check with `golang.org/x/crypto/ssh/knownhosts` only: `HostKeyAlgorithms` from the placeholder-key `KeyError.Want` lookup in "Check the host key", with `ssh-rsa` expanded to `rsa-sha2-512`, `rsa-sha2-256`, `ssh-rsa`, and left unset for an unknown host; a revoked key fails without retry; known-match continues; changed key fails without retry and prints the documented warning; unknown key prompts with fingerprint and appends on `y`/`yes` (creating `~/.ssh` and the file, `0600` on Linux/macOS).
 - [ ] TCP dial with a 10 s timeout; one `ssh.Client` per connection.
 - [ ] Platform detection with `uname -sm`, falling back to `cmd /c echo %PROCESSOR_ARCHITECTURE%`; arch mapping as documented.
-- [ ] SFTP install to `.sync-vm/agent/<16 hex of SHA-256>/sync-vm-agent[.exe]`: skip if present, else `MkdirAll`, write `.tmp`, chmod `0755` on Unix, rename (posix-rename if supported). No SFTP → documented failure.
+- [ ] Install through `internal/sftp` (ticket 17) to `.sync-vm/agent/<16 hex of SHA-256>/sync-vm-agent[.exe]`: skip if present, else `MkdirAll`, write `.tmp`, chmod `0755` on Unix, rename (posix-rename if supported). No SFTP → documented failure.
 - [ ] Start the agent with the per-OS run command; closing the stream closes stdin first, then session and client; stderr printed with `-v`.
 - [ ] `Dial` errors say whether retrying can help.
 - [ ] Agent step 0: touch own folder, remove sibling builds older than 7 days in a goroutine, ignoring errors.
 - [ ] `-v` logs each connection, remote command, put/delete with size, `Ack`, and listing/batch timings.
-- [ ] Tests against an in-process SSH + SFTP server: unknown key prompt yes/no, changed key fails without prompt, Ed25519-only `known_hosts` still connects to a server offering RSA, install then second dial skips the upload. Agent test: step 0 removes old siblings and keeps newer ones and its own.
+- [ ] Algorithm lookup tests against `known_hosts` files with a plain, a hashed, a `[host]:2222`, a wildcard, and an RSA entry.
+- [ ] Tests against an in-process SSH server whose `sftp` subsystem runs OpenSSH's `sftp-server`: unknown key prompt yes/no, changed key fails without prompt, Ed25519-only `known_hosts` still connects to a server offering RSA, install then second dial skips the upload. Agent test: step 0 removes old siblings and keeps newer ones and its own.
 - [ ] Manual check: `init` and sync against a real Linux VM.
 
 ---
@@ -281,14 +287,49 @@ Frontier at the start: 01. After 01: 02, 05, 07, 08, 09, 11 can run in parallel.
 
 ## 15: SSH connection robustness
 
-**What to build:** VMs behind a jump host and SSH configs that use `Include` work, unsupported settings are visible with `-v`, and a VM that sleeps or drops off the network is detected and reconnected without prompting.
+**What to build:** VMs behind a jump host work, unsupported settings are visible with `-v`, and a VM that sleeps or drops off the network is detected and reconnected without prompting.
 
 **Blocked by:** 13
 
 **Status:** ready-for-agent
 
 - [ ] `ProxyJump` with one hop, written as an alias or `[user@]host[:port]`, resolved with the same rules; VM connection opened through the jump client.
-- [ ] `Include` honored; `Match` ignored.
 - [ ] With `-v`, log the name of each ignored setting that applies to the host.
 - [ ] Keepalive goroutine: `keepalive@openssh.com` every 15 s with reply; 3 consecutive failures or 15 s timeouts close the client, triggering the engine's reconnect.
-- [ ] Tests against the in-process SSH server: `ProxyJump`, `Include`, `user@` overriding `User`; a server that stops answering is closed within 60 seconds.
+- [ ] Tests against the in-process SSH server: `ProxyJump` given as an alias and as `user@host:port`, `user@` overriding `User`; a server that stops answering is closed within 60 seconds.
+
+---
+
+## 16: In-house SSH config parser
+
+**What to build:** `internal/sshconfig` reads `~/.ssh/config` the way OpenSSH does for the five supported settings. `sync-vm` then resolves a Host alias to the same address, user, port, keys, and jump host that `ssh` would, without a third-party module. It is a pure package with no SSH connection, verifiable on its own with table tests.
+
+**Blocked by:** None (can start immediately).
+
+**Status:** ready-for-agent
+
+- [ ] `Lookup(host)` returns `HostName`, `User`, `Port`, `IdentityFile` (all values, in order), and `ProxyJump`, plus the names of other settings that applied, for the `-v` log.
+- [ ] Line rules from "Parse the SSH config": comments, `Key value` and `Key=value`, case-insensitive keywords, double-quoted arguments.
+- [ ] Block rules: lines before the first block apply to every host; `Host` patterns with `*`, `?`, and `!`, matched case-insensitively against the host as written; `Match` blocks never apply.
+- [ ] First value wins per keyword; `IdentityFile` collects every value.
+- [ ] `Include`: relative to `~/.ssh`, `~` expanded, sorted glob expansion, parsed in place under the enclosing block's condition, missing files skipped, error after 16 nested levels.
+- [ ] Tokens `%h`, `%d`, `%u`, `%r`, `%%` in `HostName` and `IdentityFile`; an unknown token skips that value with a warning.
+- [ ] A missing config is empty; a bad `Port` is an error naming the file and line.
+- [ ] Table tests for every rule above, against config files in a temp home folder.
+
+---
+
+## 17: In-house SFTP client
+
+**What to build:** `internal/sftp` speaks the part of SFTP version 3 that the agent install needs, over an `x/crypto/ssh` subsystem channel. The agent then uploads to Linux, macOS, and Windows VMs without going through the shell and without a third-party module. Verifiable on its own against OpenSSH's real `sftp-server`.
+
+**Blocked by:** None (can start immediately).
+
+**Status:** ready-for-agent
+
+- [ ] `NewClient(*ssh.Client)` requests the `sftp` subsystem, sends `INIT` with version 3, and records whether `posix-rename@openssh.com` is offered. A refused subsystem returns an error that bootstrap turns into the "doesn't offer SFTP" message.
+- [ ] Packet encoding and decoding per "The SFTP client"; one request in flight at a time; an unexpected request ID or reply type closes the client with a protocol error.
+- [ ] `Stat`, `MkdirAll`, `WriteFile` (32 KB writes), `Chmod`, `Remove`, `Rename`, `PosixRename`. Non-OK statuses become errors with the code and message; no-such-file matches `fs.ErrNotExist`.
+- [ ] Paths use `/`; relative paths resolve from the login user's home folder.
+- [ ] Tests against an in-process SSH server (`golang.org/x/crypto/ssh`) whose `sftp` subsystem runs OpenSSH's `sftp-server` from the documented locations, skipped with a message when none exists: `Stat` of a missing path, nested `MkdirAll`, a 1 MB `WriteFile` that reads back identical, `Chmod`, both renames.
+- [ ] A unit test with a fake server for a bad status, a wrong request ID, and a refused subsystem.
